@@ -338,12 +338,19 @@ int rtw_sta_add(struct rtw_dev *rtwdev, struct ieee80211_sta *sta,
 		struct ieee80211_vif *vif)
 {
 	struct rtw_sta_info *si = (struct rtw_sta_info *)sta->drv_priv;
+	struct rtw_vif *rtwvif = (struct rtw_vif *)vif->drv_priv;
 	int i;
 
 	si->mac_id = rtw_acquire_macid(rtwdev);
 	if (si->mac_id >= RTW_MAX_MAC_ID_NUM)
 		return -ENOSPC;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+	if (vif->type == NL80211_IFTYPE_STATION && vif->cfg.assoc == 0)
+#else
+	if (vif->type == NL80211_IFTYPE_STATION && vif->bss_conf.assoc == 0)
+#endif
+		rtwvif->mac_id = si->mac_id;
 	si->rtwdev = rtwdev;
 	si->sta = sta;
 	si->vif = vif;
@@ -2292,9 +2299,15 @@ void rtw_core_deinit(struct rtw_dev *rtwdev)
 		release_firmware(wow_fw->firmware);
 
 	destroy_workqueue(rtwdev->tx_wq);
+# if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
+	timer_delete_sync(&rtwdev->tx_report.purge_timer);
+# else
+	del_timer_sync(&rtwdev->tx_report.purge_timer);
+# endif
 	spin_lock_irqsave(&rtwdev->tx_report.q_lock, flags);
 	skb_queue_purge(&rtwdev->tx_report.queue);
 	skb_queue_purge(&rtwdev->coex.queue);
+	skb_queue_purge(&rtwdev->c2h_queue);
 	spin_unlock_irqrestore(&rtwdev->tx_report.q_lock, flags);
 
 	list_for_each_entry_safe(rsvd_pkt, tmp, &rtwdev->rsvd_page_list,
@@ -2454,6 +2467,9 @@ static void rtw_port_switch_iter(void *data, u8 *mac, struct ieee80211_vif *vif)
 	rtw_dbg(rtwdev, RTW_DBG_STATE, "AP port switch from %d -> %d\n",
 		rtwvif_ap->port, rtwvif_target->port);
 
+	/* Leave LPS so the value swapped are not in PS mode */
+	rtw_leave_lps(rtwdev);
+
 	reg1 = &rtwvif_ap->conf->net_type;
 	reg2 = &rtwvif_target->conf->net_type;
 	rtw_swap_reg_mask(rtwdev, reg1, reg2);
@@ -2472,6 +2488,8 @@ static void rtw_port_switch_iter(void *data, u8 *mac, struct ieee80211_vif *vif)
 
 	swap(rtwvif_target->port, rtwvif_ap->port);
 	swap(rtwvif_target->conf, rtwvif_ap->conf);
+
+	rtw_fw_default_port(rtwdev, rtwvif_target);
 }
 
 void rtw_core_port_switch(struct rtw_dev *rtwdev, struct ieee80211_vif *vif)
@@ -2521,10 +2539,13 @@ void rtw_core_enable_beacon(struct rtw_dev *rtwdev, bool enable)
 	if (!rtwdev->ap_active)
 		return;
 
-	if (enable)
+	if (enable) {
 		rtw_write32_set(rtwdev, REG_BCN_CTRL, BIT_EN_BCN_FUNCTION);
-	else
+		rtw_write32_clr(rtwdev, REG_TXPAUSE, BIT_HIGH_QUEUE);
+	} else {
 		rtw_write32_clr(rtwdev, REG_BCN_CTRL, BIT_EN_BCN_FUNCTION);
+		rtw_write32_set(rtwdev, REG_TXPAUSE, BIT_HIGH_QUEUE);
+	}
 }
 
 MODULE_AUTHOR("Realtek Corporation");
